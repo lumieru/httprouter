@@ -78,12 +78,14 @@ package httprouter
 
 import (
 	"net/http"
+	"golang.org/x/net/context"
+	"github.com/codegangsta/negroni"
 )
 
 // Handle is a function that can be registered to a route to handle HTTP
 // requests. Like http.HandlerFunc, but has a third parameter for the values of
 // wildcards (variables).
-type Handle func(http.ResponseWriter, *http.Request, Params)
+type Handle func(context.Context, http.ResponseWriter, *http.Request, Params)
 
 // Param is a single URL parameter, consisting of a key and a value.
 type Param struct {
@@ -233,7 +235,7 @@ func (r *Router) Handle(method, path string, handle Handle) {
 // request handle.
 func (r *Router) Handler(method, path string, handler http.Handler) {
 	r.Handle(method, path,
-		func(w http.ResponseWriter, req *http.Request, _ Params) {
+		func(_ context.Context, w http.ResponseWriter, req *http.Request, _ Params) {
 			handler.ServeHTTP(w, req)
 		},
 	)
@@ -243,6 +245,22 @@ func (r *Router) Handler(method, path string, handler http.Handler) {
 // request handle.
 func (r *Router) HandlerFunc(method, path string, handler http.HandlerFunc) {
 	r.Handler(method, path, handler)
+}
+
+// ContextHandler is an adapter which allows the usage of a negroni.ContextHandler as a
+// request handle.
+func (r *Router) ContextHandler(method, path string, handler negroni.ContextHandler) {
+	r.Handle(method, path,
+		func(ctx context.Context, w http.ResponseWriter, req *http.Request, _ Params) {
+			handler.ServeHTTPC(ctx, w, req)
+		},
+	)
+}
+
+// ContextHandlerFunc is an adapter which allows the usage of a negroni.ContextHandlerFunc as a
+// request handle.
+func (r *Router) ContextHandlerFunc(method, path string, handler negroni.ContextHandlerFunc) {
+	r.ContextHandler(method, path, handler)
 }
 
 // ServeFiles serves files from the given file system root.
@@ -262,7 +280,7 @@ func (r *Router) ServeFiles(path string, root http.FileSystem) {
 
 	fileServer := http.FileServer(root)
 
-	r.GET(path, func(w http.ResponseWriter, req *http.Request, ps Params) {
+	r.GET(path, func(_ context.Context, w http.ResponseWriter, req *http.Request, ps Params) {
 		req.URL.Path = ps.ByName("filepath")
 		fileServer.ServeHTTP(w, req)
 	})
@@ -288,6 +306,11 @@ func (r *Router) Lookup(method, path string) (Handle, Params, bool) {
 
 // ServeHTTP makes the router implement the http.Handler interface.
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	r.ServeHTTPC(context.Background(), w, req)
+}
+
+// ServeHTTPC makes the router implement the negroni.ContextHandler interface.
+func (r *Router) ServeHTTPC(ctx context.Context, w http.ResponseWriter, req *http.Request) {
 	if r.PanicHandler != nil {
 		defer r.recv(w, req)
 	}
@@ -296,7 +319,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		path := req.URL.Path
 
 		if handle, ps, tsr := root.getValue(path); handle != nil {
-			handle(w, req, ps)
+			handle(ctx, w, req, ps)
 			return
 		} else if req.Method != "CONNECT" && path != "/" {
 			code := 301 // Permanent redirect, request with GET method

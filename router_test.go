@@ -11,6 +11,8 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"testing"
+	"golang.org/x/net/context"
+	"github.com/codegangsta/negroni"
 )
 
 type mockResponseWriter struct{}
@@ -49,11 +51,14 @@ func TestRouter(t *testing.T) {
 	router := New()
 
 	routed := false
-	router.Handle("GET", "/user/:name", func(w http.ResponseWriter, r *http.Request, ps Params) {
+	router.Handle("GET", "/user/:name", func(ctx context.Context, w http.ResponseWriter, r *http.Request, ps Params) {
 		routed = true
 		want := Params{Param{"name", "gopher"}}
 		if !reflect.DeepEqual(ps, want) {
 			t.Fatalf("wrong wildcard values: want %v, got %v", want, ps)
+		}
+		if ctx != context.Background() {
+			t.Errorf("ctx != context.Background()")
 		}
 	})
 
@@ -64,6 +69,109 @@ func TestRouter(t *testing.T) {
 
 	if !routed {
 		t.Fatal("routing failed")
+	}
+}
+
+func TestContextHandler(t *testing.T) {
+	router := New()
+
+	router.Handler("GET", "/handler", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request){
+		fmt.Fprint(w, "GET /handler")
+	}))
+
+	router.HandlerFunc("GET", "/handlerfunc", func(w http.ResponseWriter, r *http.Request){
+		fmt.Fprint(w, "GET /handlerfunc")
+	})
+
+	router.ContextHandler("GET", "/contexthandler",
+		negroni.ContextHandlerFunc(func(ctx context.Context, w http.ResponseWriter, r *http.Request){
+			fmt.Fprintf(w, "GET /contexthandler, value(1)=%s", ctx.Value(1).(string))
+		}))
+
+	router.ContextHandlerFunc("GET", "/contexthandlerfunc", func(ctx context.Context, w http.ResponseWriter, r *http.Request){
+		fmt.Fprintf(w, "GET /contexthandlerfunc, value(2)=%s", ctx.Value(2).(string))
+	})
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/handler", nil)
+	router.ServeHTTPC(context.TODO(), w, req)
+	if w.Code != http.StatusOK || w.Body.String() != "GET /handler" {
+		t.Errorf("GET /handler failed")
+	}
+
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest("GET", "/handlerfunc", nil)
+	router.ServeHTTPC(context.TODO(), w, req)
+	if w.Code != http.StatusOK || w.Body.String() != "GET /handlerfunc" {
+		t.Errorf("GET /handlerfunc failed")
+	}
+
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest("GET", "/contexthandler", nil)
+	router.ServeHTTPC(context.WithValue(context.Background(), 1, "Haha!"), w, req)
+	if w.Code != http.StatusOK || w.Body.String() != "GET /contexthandler, value(1)=Haha!" {
+		t.Errorf("GET /contexthandler failed")
+	}
+
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest("GET", "/contexthandlerfunc", nil)
+	router.ServeHTTPC(context.WithValue(context.Background(), 2, "We are family!"), w, req)
+	if w.Code != http.StatusOK || w.Body.String() != "GET /contexthandlerfunc, value(2)=We are family!" {
+		t.Errorf("GET /contexthandlerfunc failed")
+	}
+}
+
+func TestWorkWithNegroni(t *testing.T) {
+	m1 := func(ctx context.Context, w http.ResponseWriter, r *http.Request, next negroni.ContextHandlerFunc) {
+		fmt.Fprint(w, "+middleware1")
+		next(ctx, w, r)
+	}
+	m2 := func(ctx context.Context, w http.ResponseWriter, r *http.Request, next negroni.ContextHandlerFunc) {
+		fmt.Fprint(w, "+middleware2")
+		ctx = context.WithValue(ctx, "m2", "Hahaha")
+		next(ctx, w, r)
+	}
+	m3 := func(ctx context.Context, w http.ResponseWriter, r *http.Request, next negroni.ContextHandlerFunc) {
+		fmt.Fprint(w, "+middleware3")
+		next(ctx, w, r)
+	}
+	h1 := func(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "+handler1:m2=%s", ctx.Value("m2").(string))
+	}
+	h2 := func(ctx context.Context, w http.ResponseWriter, r *http.Request, ps Params) {
+		fmt.Fprintf(w, "+handler2:ps=%s, m2=%s", ps.ByName("name"), ctx.Value("m2").(string))
+	}
+
+	endrouter := New()
+	endrouter.GET("/admin/handler2/:name", h2)
+	endrouter.ContextHandlerFunc("GET", "/admin/handler1", h1)
+
+	m12 := negroni.New(negroni.HandlerFunc(m1), negroni.HandlerFunc(m2), negroni.WrapCH(negroni.ContextHandlerFunc(h1)))
+	m32 := negroni.New(negroni.HandlerFunc(m3), negroni.HandlerFunc(m2), negroni.WrapCH(endrouter))
+
+	root := New()
+	root.ContextHandler("GET", "/", m12)
+	root.ContextHandler("GET", "/admin/*fp", m32)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/", nil)
+	root.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || w.Body.String() != "+middleware1+middleware2+handler1:m2=Hahaha" {
+		t.Errorf("GET / failed: %v", w)
+	}
+
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest("GET", "/admin/handler2/lumieru", nil)
+	root.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || w.Body.String() != "+middleware3+middleware2+handler2:ps=lumieru, m2=Hahaha" {
+		t.Errorf("GET /admin/handler2/lumieru failed: %v", w)
+	}
+
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest("GET", "/admin/handler1", nil)
+	root.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || w.Body.String() != "+middleware3+middleware2+handler1:m2=Hahaha" {
+		t.Errorf("GET /admin/handler1 failed: %v", w)
 	}
 }
 
@@ -81,25 +189,25 @@ func TestRouterAPI(t *testing.T) {
 	httpHandler := handlerStruct{&handler}
 
 	router := New()
-	router.GET("/GET", func(w http.ResponseWriter, r *http.Request, _ Params) {
+	router.GET("/GET", func(_ context.Context, w http.ResponseWriter, r *http.Request, _ Params) {
 		get = true
 	})
-	router.HEAD("/GET", func(w http.ResponseWriter, r *http.Request, _ Params) {
+	router.HEAD("/GET", func(_ context.Context, w http.ResponseWriter, r *http.Request, _ Params) {
 		head = true
 	})
-	router.OPTIONS("/GET", func(w http.ResponseWriter, r *http.Request, _ Params) {
+	router.OPTIONS("/GET", func(_ context.Context, w http.ResponseWriter, r *http.Request, _ Params) {
 		options = true
 	})
-	router.POST("/POST", func(w http.ResponseWriter, r *http.Request, _ Params) {
+	router.POST("/POST", func(_ context.Context, w http.ResponseWriter, r *http.Request, _ Params) {
 		post = true
 	})
-	router.PUT("/PUT", func(w http.ResponseWriter, r *http.Request, _ Params) {
+	router.PUT("/PUT", func(_ context.Context, w http.ResponseWriter, r *http.Request, _ Params) {
 		put = true
 	})
-	router.PATCH("/PATCH", func(w http.ResponseWriter, r *http.Request, _ Params) {
+	router.PATCH("/PATCH", func(_ context.Context, w http.ResponseWriter, r *http.Request, _ Params) {
 		patch = true
 	})
-	router.DELETE("/DELETE", func(w http.ResponseWriter, r *http.Request, _ Params) {
+	router.DELETE("/DELETE", func(_ context.Context, w http.ResponseWriter, r *http.Request, _ Params) {
 		delete = true
 	})
 	router.Handler("GET", "/Handler", httpHandler)
@@ -180,13 +288,13 @@ func TestRouterChaining(t *testing.T) {
 	router1.NotFound = router2
 
 	fooHit := false
-	router1.POST("/foo", func(w http.ResponseWriter, req *http.Request, _ Params) {
+	router1.POST("/foo", func(_ context.Context, w http.ResponseWriter, req *http.Request, _ Params) {
 		fooHit = true
 		w.WriteHeader(http.StatusOK)
 	})
 
 	barHit := false
-	router2.POST("/bar", func(w http.ResponseWriter, req *http.Request, _ Params) {
+	router2.POST("/bar", func(_ context.Context, w http.ResponseWriter, req *http.Request, _ Params) {
 		barHit = true
 		w.WriteHeader(http.StatusOK)
 	})
@@ -217,7 +325,7 @@ func TestRouterChaining(t *testing.T) {
 }
 
 func TestRouterNotAllowed(t *testing.T) {
-	handlerFunc := func(_ http.ResponseWriter, _ *http.Request, _ Params) {}
+	handlerFunc := func(_ context.Context, _ http.ResponseWriter, _ *http.Request, _ Params) {}
 
 	router := New()
 	router.POST("/path", handlerFunc)
@@ -246,7 +354,7 @@ func TestRouterNotAllowed(t *testing.T) {
 }
 
 func TestRouterNotFound(t *testing.T) {
-	handlerFunc := func(_ http.ResponseWriter, _ *http.Request, _ Params) {}
+	handlerFunc := func(_ context.Context, _ http.ResponseWriter, _ *http.Request, _ Params) {}
 
 	router := New()
 	router.GET("/path", handlerFunc)
@@ -318,7 +426,7 @@ func TestRouterPanicHandler(t *testing.T) {
 		panicHandled = true
 	}
 
-	router.Handle("PUT", "/user/:name", func(_ http.ResponseWriter, _ *http.Request, _ Params) {
+	router.Handle("PUT", "/user/:name", func(_ context.Context, _ http.ResponseWriter, _ *http.Request, _ Params) {
 		panic("oops!")
 	})
 
@@ -340,7 +448,7 @@ func TestRouterPanicHandler(t *testing.T) {
 
 func TestRouterLookup(t *testing.T) {
 	routed := false
-	wantHandle := func(_ http.ResponseWriter, _ *http.Request, _ Params) {
+	wantHandle := func(_ context.Context, _ http.ResponseWriter, _ *http.Request, _ Params) {
 		routed = true
 	}
 	wantParams := Params{Param{"name", "gopher"}}
@@ -363,7 +471,7 @@ func TestRouterLookup(t *testing.T) {
 	if handle == nil {
 		t.Fatal("Got no handle!")
 	} else {
-		handle(nil, nil, nil)
+		handle(nil, nil, nil, nil)
 		if !routed {
 			t.Fatal("Routing failed!")
 		}
